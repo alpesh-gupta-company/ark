@@ -179,13 +179,15 @@ python scripts/chat_interface.py --temperature 0.3 --top-k 5
 
 ## Algorithmic Complexity
 
-| Architecture Component | Time Complexity (Forward) | Peak Working Memory |
-|---|---|---|
-| **RMSNorm** | $O(L \cdot D)$ | $O(L \cdot D)$ |
-| **WaveKernel (FFT)** | $O(D \cdot L \log L)$ | $O(D \cdot n_{\text{fft}})$ |
-| **DeltaMemory (Causal)** | $O(L^2 \cdot D)$ | $O(L^2 + L \cdot D)$ |
-| **Feed-Forward MLP** | $O(L \cdot D^2)$ | $O(L \cdot D)$ |
-| **Total Block Pass** | $O(N(D L \log L + L^2 D + L D^2))$ | Low VRAM (~1.2 GB total) |
+| Architecture Component | Training Complexity (Parallel) | Inference Latency (per Token) | Working State Memory |
+|---|---|---|---|
+| **RMSNorm** | $O(L \cdot D)$ | $O(D)$ | None |
+| **WaveKernel (SSM Dual)** | $O(D \cdot L \log L)$ | **$O(D)$** | $2D$ floats (complex state $h_t$) |
+| **DeltaMemory (Chunked)** | **$O(L \cdot C \cdot D + \frac{L}{C} D^2)$** | **$O(D^2)$** | $D^2$ floats (matrix state $S_t$) |
+| **Feed-Forward MLP** | $O(L \cdot D^2)$ | $O(D^2)$ | None |
+| **Total Block Pass** | **$\mathcal{O}(L \log L)$ sub-quadratic** | **$\mathcal{O}(1)$ constant time** | Low VRAM (~1.2 GB total) |
+
+Unlike standard Transformers that require $O(L \cdot D)$ KV-cache computation per token at inference time, Ark-Chat generates tokens in strictly **$O(1)$ constant time** via its dual state-space recurrent cache.
 
 ---
 

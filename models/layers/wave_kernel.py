@@ -47,3 +47,26 @@ class WaveKernel(nn.Module):
         
         # Slice back to original length and restore original dtype (e.g., float16)
         return y[:, :L, :].to(x.dtype)
+
+    def _get_ssm_params(self, device):
+        decay = torch.exp(-self.alpha)
+        lam = torch.complex(decay * torch.cos(self.omega), decay * torch.sin(self.omega))
+        phase = torch.complex(torch.cos(self.phi), torch.sin(self.phi))
+        return lam.to(device), phase.to(device)
+
+    def step(self, x_t, state=None):
+        """
+        O(D) single-step State Space recurrence for constant-time inference:
+            h_t = lambda * h_{t-1} + x_t
+            y_t = Re(phase * h_t)
+        """
+        B, D = x_t.shape
+        lam, phase = self._get_ssm_params(x_t.device)
+        if state is None:
+            state = torch.zeros(B, D, dtype=torch.cfloat, device=x_t.device)
+        next_state = lam * state + x_t.to(torch.cfloat)
+        y_t = (phase * next_state).real.to(x_t.dtype)
+        return y_t, next_state
+
+    def init_state(self, batch_size, device):
+        return torch.zeros(batch_size, self.d_model, dtype=torch.cfloat, device=device)

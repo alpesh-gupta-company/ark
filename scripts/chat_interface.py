@@ -83,12 +83,12 @@ def chat(args):
             sys.stdout.flush()
             
             with torch.no_grad():
+                # 1. Prefill prompt tokens and initialize O(1) recurrent state cache
+                last_logits, cache = model.prefill(x)
+                last_logits = last_logits[0]
+                cur_pos = len(tokens)
+                
                 for _ in range(100):  # Max new tokens
-                    # Forward pass. We MUST truncate x to max_seq_len 
-                    # otherwise the positional embedding lookup goes out of bounds!
-                    logits = model(x[:, -max_seq_len:])
-                    last_logits = logits[0, -1, :]
-                    
                     if args.greedy or args.temperature <= 0.05:
                         next_token = torch.argmax(last_logits).item()
                     else:
@@ -101,7 +101,6 @@ def chat(args):
                         next_token = torch.multinomial(probs, num_samples=1).item()
                     
                     generated_tokens.append(next_token)
-                    x = torch.cat([x, torch.tensor([[next_token]], device=device)], dim=1)
                     
                     # Live streaming output
                     chunk = tokenizer.decode([next_token])
@@ -114,6 +113,12 @@ def chat(args):
                         break
                     if "\n" in chunk and len(generated_tokens) >= 5:
                         break
+                    
+                    # 2. O(1) state space step: computes next logits without re-processing past tokens
+                    next_token_tensor = torch.tensor([next_token], device=device)
+                    logits_step, cache = model.step(next_token_tensor, pos_idx=cur_pos, cache=cache)
+                    last_logits = logits_step[0]
+                    cur_pos += 1
             
             # Append generated text to history
             final_generation = tokenizer.decode(generated_tokens).split("User:")[0].strip()

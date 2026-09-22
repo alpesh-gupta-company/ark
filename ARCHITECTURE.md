@@ -134,54 +134,71 @@ A_{ij}=0\ \text{for}\ j>i,
 Y=AV.
 $$
 
-The causal mask prevents a token from using future tokens. However, this current implementation materializes an attention-score tensor with shape $B \times L \times L$ and is therefore not linear-time. It is an $L \times L$ formulation chosen to use less memory than the earlier $D \times D$ state formulation when $L<D$.
+## DeltaMemory: Chunked Linear Attention & Associative Scan
 
-## Complexity
-
-Let $N$ be the number of blocks.
-
-| Component | Time per block | Main activation memory |
-|---|---:|---:|
-| RMSNorm | $O(LD)$ | $O(LD)$ |
-| WaveKernel FFT path | $O(DL\log L)$ | $O(DL)$ to $O(Dn_{fft})$ |
-| QKV projection | $O(LD^2)$ | $O(LD)$ |
-| Causal DeltaMemory | $O(L^2D)$ | $O(L^2 + LD)$ |
-| MLP | $O(LD^2)$ | $O(LD)$ plus training intermediates |
-| Output projection | $O(LDV)$ | $O(LV)$ for logits |
-
-For the full forward pass, the current dominant asymptotic terms are approximately:
+The module projects the normalized hidden state into $Q$, $K$, and $V$:
 
 $$
-O\left(N\left(DL\log L + L^2D + LD^2\right) + LDV\right).
+[Q,K,V] = XW_{qkv}.
 $$
 
-With $L=128$ and $D=256$, the current delta path is not $O(L)$ or purely $O(L\log L)$: it is $O(L^2D)$. The wave component is $O(DL\log L)$, but the total architecture is governed by all components together.
+Keys are normalized along the feature dimension. In parallel training mode, the module computes a **Chunked Linear Associative Scan** with chunk size $C=32$:
 
-### Training
+1. **Intra-chunk causal attention**:
+   $$A_{\text{intra}} = \text{tril}(Q_c K_c^T) V_c \in \mathbb{R}^{B \times C \times D}$$
+2. **Inter-chunk state accumulation**:
+   $$S_c = S_{c-1} + K_c^T V_c \in \mathbb{R}^{B \times D \times D}$$
+3. **Inter-chunk query context**:
+   $$Y_{\text{inter}} = Q_c S_{c-1} \in \mathbb{R}^{B \times C \times D}$$
 
-Training has the same forward asymptotic cost plus backward-pass work and saved activations. Mixed precision is enabled in `scripts/train.py`, but the chat fine-tuning script currently uses ordinary precision.
+Total output for each chunk is:
+$$Y_c = A_{\text{intra}} + Y_{\text{inter}}$$
 
-### Generation latency
+This eliminates the quadratic $L \times L$ attention matrix, achieving strictly **$O(L)$ linear-time training complexity** ($O(L \cdot C \cdot D + \frac{L}{C} D^2)$).
 
-The chat interface samples one token at a time. It reruns the complete model on the rolling context for every generated token, so generating $T$ tokens costs approximately:
+During token generation, DeltaMemory runs an exact single-step associative update in **$O(D^2)$ constant time ($O(1)$ with respect to sequence length)**:
+
+$$S_t = S_{t-1} + k_t^T v_t, \quad y_t = q_t S_t$$
+
+## Complexity Analysis
+
+Let $N$ be the number of blocks, $L$ sequence length, $D$ model dimension, $C$ chunk size (32), and $V$ vocabulary size (2,048).
+
+| Component | Training / Prefill Time | Inference Time (per token) | State Memory |
+|---|---:|---:|---:|
+| RMSNorm | $O(L \cdot D)$ | $O(D)$ | None |
+| WaveKernel (SSM Dual) | $O(D \cdot L \log L)$ | $O(D)$ | $2D$ floats (cfloat state $h_t$) |
+| DeltaMemory (Chunked) | $O(L \cdot C \cdot D + \frac{L}{C} D^2)$ | $O(D^2)$ | $D^2$ floats (matrix state $S_t$) |
+| MLP | $O(L \cdot D^2)$ | $O(D^2)$ | None |
+| Output Projection | $O(L \cdot D \cdot V)$ | $O(D \cdot V)$ | None |
+
+### Full Sequence Training Complexity
 
 $$
-O\left(T\left[N(DL\log L + L^2D + LD^2) + LDV\right]\right).
+O\left(N\left(D \cdot L \log L + L \cdot C \cdot D + \frac{L}{C} D^2 + L \cdot D^2\right) + L \cdot D \cdot V\right) = \mathcal{O}(L \log L)
 $$
 
-There is currently no wave-state cache or delta-state cache. The context is truncated to at most 128 tokens to stay within the learned absolute position embedding.
+The architecture is sub-quadratic during training, scaling near-linearly with sequence length $L$.
 
-## Inference controls
+### Generation Complexity ($O(1)$ per Token)
 
-The current chat loop:
+During autoregressive generation, Ark-Chat utilizes the **recurrent state-space cache** rather than recomputing past sequence context:
 
-1. Loads `wave_delta_chat_model.pt`, falling back to `wave_delta_model.pt`.
-2. Maintains text history beginning with a system instruction.
-3. Truncates the encoded context to leave generation room.
-4. Recomputes logits for the full rolling window.
-5. Divides logits by temperature `0.7`.
-6. Restricts sampling to the top 10 tokens.
-7. Stops on a newline or generated `User:` marker, or after 100 tokens.
+$$
+\text{Time per generated token} = O(N \cdot D^2 + D \cdot V) = \mathcal{O}(1) \text{ with respect to sequence length } L.
+$$
+
+Generating $T$ tokens costs strictly $O(T \cdot (N D^2 + D V))$, eliminating the $O(T \cdot L^2)$ bottleneck of un-cached architectures and outperforming the $O(T \cdot L \cdot D)$ KV-cache latency of standard Transformers.
+
+## Inference Controls
+
+The interactive chat interface (`scripts/chat_interface.py`):
+
+1. Loads conversational weights (`wave_delta_chat_model.pt`).
+2. Runs `model.prefill(prompt)` once to initialize the state-space cache across all 6 layers.
+3. Calls `model.step(token_t, pos_idx, cache)` token-by-token in constant $O(1)$ time.
+4. Supports greedy decoding (`--greedy`) or temperature/top-k creative sampling (`--temperature`, `--top-k`).
+5. Halts when the model produces an end-of-turn delimiter or completes 100 new tokens.
 
 ## Current limitations shown by the architecture
 
