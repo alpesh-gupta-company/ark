@@ -1,0 +1,7 @@
+# Ignore the chat directory
+chat/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
