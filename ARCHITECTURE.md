@@ -6,7 +6,7 @@ This document describes the implementation currently in `ark-chat`. It is based 
 
 ```mermaid
 flowchart TD
-    A[Wikipedia text or conversation records] --> B[Byte-level BPE tokenizer\n256-token vocabulary]
+    A[Wikipedia text or conversation records] --> B[Byte-level BPE tokenizer\n2048-token vocabulary]
     B --> C[Token IDs\nB x L]
     C --> D[Token embedding\nB x L x D]
     P[Learned absolute position embedding\nL x D] --> E

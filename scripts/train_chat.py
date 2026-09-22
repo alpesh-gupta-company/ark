@@ -171,8 +171,11 @@ def train_chat(args):
 
     tokenizer = BPETokenizer(vocab_size=config["model"]["vocab_size"])
     state = torch.load(args.tokenizer, map_location="cpu")
-    tokenizer.merges = state["merges"]
-    tokenizer.vocab = state["vocab"]
+    if hasattr(tokenizer, "load_state"):
+        tokenizer.load_state(state)
+    else:
+        tokenizer.merges = state["merges"]
+        tokenizer.vocab = state["vocab"]
     config["model"]["vocab_size"] = len(tokenizer.vocab)
 
     dataset = ConversationalDataset(

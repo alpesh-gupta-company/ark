@@ -43,22 +43,39 @@ def train():
 
     tokenizer_path = 'data/bpe_state.pt'
     tokens_path = 'data/encoded_tokens.pt'
-    tokenizer = BPETokenizer(vocab_size=config['model']['vocab_size'])
+    requested_vocab_size = config['model']['vocab_size']
+    tokenizer = BPETokenizer(vocab_size=requested_vocab_size)
 
+    cache_valid = False
     if os.path.exists(tokenizer_path) and os.path.exists(tokens_path):
-        print("📂 [CACHE] Loading BPE state...")
-        state = torch.load(tokenizer_path)
-        tokenizer.merges = state['merges']
-        tokenizer.vocab = state['vocab']
-        tokens = torch.load(tokens_path)
-    else:
-        print("🔄 [SETUP] Encoding text (This takes a few minutes)...")
-        with open('data/input.txt', 'r', encoding='utf-8') as f:
+        try:
+            state = torch.load(tokenizer_path, map_location='cpu')
+            if hasattr(tokenizer, 'load_state'):
+                tokenizer.load_state(state)
+            else:
+                tokenizer.merges = state['merges']
+                tokenizer.vocab = state['vocab']
+            if len(tokenizer.vocab) == requested_vocab_size:
+                tokens = torch.load(tokens_path)
+                cache_valid = True
+                print(f"📂 [CACHE] Loaded valid BPE state (vocab_size: {len(tokenizer.vocab)})...")
+            else:
+                print(f"🔄 [CACHE MISMATCH] Cached vocab {len(tokenizer.vocab)} != config {requested_vocab_size}. Rebuilding...")
+        except Exception as e:
+            print(f"🔄 [CACHE ERROR] {e}. Rebuilding...")
+
+    if not cache_valid:
+        print(f"🔄 [SETUP] Training BPE tokenizer (vocab_size={requested_vocab_size})...")
+        input_path = 'data/input.txt'
+        tokenizer.train(input_path)
+        with open(input_path, 'r', encoding='utf-8') as f:
             text = f.read()
-        tokenizer.train(text)
+        print("🔄 [SETUP] Encoding dataset tokens...")
         tokens = tokenizer.encode(text)
-        torch.save({'merges': tokenizer.merges, 'vocab': tokenizer.vocab}, tokenizer_path)
+        save_state = tokenizer.get_state() if hasattr(tokenizer, 'get_state') else {'merges': tokenizer.merges, 'vocab': tokenizer.vocab}
+        torch.save(save_state, tokenizer_path)
         torch.save(tokens, tokens_path)
+        print(f"✅ Tokenizer saved ({len(tokenizer.vocab)} tokens), dataset cached ({len(tokens)} tokens).")
 
     actual_vocab_size = len(tokenizer.vocab)
     config['model']['vocab_size'] = actual_vocab_size
