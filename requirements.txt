@@ -1,6 +1,7 @@
 torch>=2.0.0
 numpy
 pyyaml
-wandb
+pandas
+tokenizers
+datasets
 tqdm
-einops

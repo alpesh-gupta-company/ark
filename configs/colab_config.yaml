@@ -1,0 +1,20 @@
+# ============================================================
+# Ark-Chat T4 Configuration (~55M parameters)
+# Target: Google Colab T4 GPU (16GB VRAM)
+# ============================================================
+model:
+  vocab_size: 32000
+  d_model: 512
+  n_layers: 12
+  seq_len: 2048
+  n_heads: 8
+  dropout: 0.1
+
+training:
+  batch_size: 16       # Maximizing T4 16GB VRAM (was 4)
+  seq_len: 2048
+  learning_rate: 0.0003
+  epochs: 3
+  warmup_steps: 500
+  grad_accum_steps: 4  # Effective batch: 16 * 4 = 64 sequences (131k tokens/step)
+  # Effective batch: 4 * 8 = 32 sequences = 65,536 tokens/step

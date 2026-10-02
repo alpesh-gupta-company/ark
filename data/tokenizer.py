@@ -8,27 +8,33 @@ except ImportError:
     HAS_TOKENIZERS = False
 
 
+EOT_STRING = "<|eot|>"
+
+
 class BPETokenizer:
-    def __init__(self, vocab_size=2048):
+    def __init__(self, vocab_size=8192):
         self.vocab_size = vocab_size
         self._tokenizer = None
         self._vocab = {}
         self._merges = {}
+        self._eot_id = None
 
     def train(self, text_or_path):
         if HAS_TOKENIZERS:
             tok = ByteLevelBPETokenizer()
+            special_tokens = [EOT_STRING]
             if isinstance(text_or_path, str) and os.path.isfile(text_or_path):
                 print(f"🔄 [BPE] Training ByteLevelBPETokenizer on file {text_or_path} (target vocab: {self.vocab_size})...")
-                tok.train(files=[text_or_path], vocab_size=self.vocab_size, min_frequency=2)
+                tok.train(files=[text_or_path], vocab_size=self.vocab_size, min_frequency=2, special_tokens=special_tokens)
             else:
                 corpus = [text_or_path] if isinstance(text_or_path, str) else list(text_or_path)
                 print(f"🔄 [BPE] Training ByteLevelBPETokenizer on text iterator (target vocab: {self.vocab_size})...")
-                tok.train_from_iterator(corpus, vocab_size=self.vocab_size, min_frequency=1)
+                tok.train_from_iterator(corpus, vocab_size=self.vocab_size, min_frequency=1, special_tokens=special_tokens)
             self._tokenizer = tok
             self._vocab = tok.get_vocab()
             self.vocab_size = tok.get_vocab_size()
-            print(f"✅ [BPE] Training complete. Vocabulary size: {self.vocab_size}")
+            self._eot_id = self._vocab.get(EOT_STRING)
+            print(f"✅ [BPE] Training complete. Vocabulary size: {self.vocab_size}, EOT id: {self._eot_id}")
         else:
             self._train_pure_python(text_or_path)
 
@@ -39,7 +45,7 @@ class BPETokenizer:
         print(f"🔄 [BPE fallback] Analyzing {len(text)} characters...")
         tokens = list(text.encode('utf-8'))
         ids = list(tokens)
-        num_merges = max(0, self.vocab_size - 256)
+        num_merges = max(0, self.vocab_size - 256 - 1)  # Reserve 1 slot for EOT
         self._vocab = {i: bytes([i]) for i in range(256)}
         self._merges = {}
         for i in range(num_merges):
@@ -62,13 +68,29 @@ class BPETokenizer:
             ids = newids
             self._merges[pair] = idx
             self._vocab[idx] = self._vocab[pair[0]] + self._vocab[pair[1]]
+        # Add EOT token at end of vocab
+        eot_idx = len(self._vocab)
+        self._vocab[eot_idx] = EOT_STRING.encode('utf-8')
+        self._eot_id = eot_idx
+        self.vocab_size = len(self._vocab)
+
+    @property
+    def eot_id(self):
+        """Returns the token ID for the end-of-turn special token."""
+        if self._eot_id is not None:
+            return self._eot_id
+        v = self.vocab
+        if EOT_STRING in v:
+            self._eot_id = v[EOT_STRING]
+        return self._eot_id
 
     def get_state(self):
         return {
             'tokenizer_json': self._tokenizer.to_str() if self._tokenizer else '',
             'vocab_size': len(self.vocab),
             'vocab': self.vocab,
-            'merges': self._merges
+            'merges': self._merges,
+            'eot_id': self._eot_id,
         }
 
     def load_state(self, state):
@@ -78,11 +100,13 @@ class BPETokenizer:
                 self._vocab = self._tokenizer.get_vocab()
                 self._merges = state.get('merges', {})
                 self.vocab_size = self._tokenizer.get_vocab_size()
+                self._eot_id = state.get('eot_id') or self._vocab.get(EOT_STRING)
                 return
         if isinstance(state, dict):
             self._vocab = state.get('vocab', {})
             self._merges = state.get('merges', {})
             self.vocab_size = len(self._vocab) if self._vocab else self.vocab_size
+            self._eot_id = state.get('eot_id')
 
     @property
     def vocab(self):
