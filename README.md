@@ -3,215 +3,141 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Hardware](https://img.shields.io/badge/GPU-GTX%201650%20(4GB)%20Compatible-green.svg)](https://www.nvidia.com/)
+[![Hardware](https://img.shields.io/badge/GPU-T4%20%7C%20GTX%201650-green.svg)](https://www.nvidia.com/)
 
 **Ark-Chat** is a lightweight, from-scratch conversational language model that explores a hybrid physical wave equation and causal associative memory architecture as an alternative to quadratic softmax attention.
 
-Designed specifically to research sub-quadratic sequence mixing and low-memory training on consumer hardware (such as an NVIDIA GTX 1650 4GB GPU), Ark-Chat combines:
-1. **WaveKernel**: Frequency-domain continuous wave propagation ($O(L \log L)$ sequence mixing via Fast Fourier Transforms).
-2. **Causal Delta Memory**: A low-memory associative recall mechanism with causal masking.
-3. **Subword BPE Tokenization**: A high-throughput 2,048-vocabulary Byte-Level BPE tokenizer.
-4. **End-to-End Instruction Fine-Tuning**: A supervised training pipeline with assistant-only loss masking and validation checkpointing.
+Originally designed for a 4GB GTX 1650, the architecture has been scaled and optimized to fully utilize a 16GB Google Colab T4 GPU (up to ~62M parameters), featuring **Chain-of-Thought (CoT) reasoning**, **Live Web Reading**, and **PyTorch 2.0 Compilation optimizations**.
 
 ---
 
-## Architecture Overview
+## Architecture Overview (v2.0)
 
 ```mermaid
 flowchart TD
-    In[Input Prompt / Dialogue History] --> Tok[Byte-Level BPE Tokenizer\n2,048 Vocab]
-    Tok --> Emb[Token + Learned Position Embedding\nShape: B x L x 256]
+    In[Input Prompt / Dialogue History] --> Tok[Byte-Level BPE Tokenizer\n32,000 Vocab]
+    Tok --> Emb[Token Embedding\nShape: B x L x 512]
     
-    subgraph Core[Wave-Delta Block x 6 Layers]
+    subgraph Core[Wave-Delta Block x 12 Layers]
         X0[Layer Input x] --> N1[RMSNorm]
-        N1 --> Wave[WaveKernel\nFFT Damped Wave Convolution\nO D L log L]
+        N1 --> Wave[Selective WaveKernel\nInput-Dependent Damped Wave\nO D L log L]
         Wave --> Res1[Residual Add\nx + scale * Wave]
         Res1 --> N2[RMSNorm]
-        N2 --> Delta[DeltaMemory\nQ K^T V Causal Associative Memory\nO L^2 D]
+        N2 --> Delta[DeltaMemory + RoPE\nQ K^T V Causal Associative Memory\nO L^2 D]
         Delta --> Res2[Residual Add\nx + scale * Delta]
-        Res2 --> MLP[Feed-Forward MLP\n256 -> 1024 -> 256 with GELU]
-        MLP --> Res3[Residual Add\nx + scale * MLP]
+        Res2 --> MLP[SwiGLU FFN\nGated Linear Unit\n512 -> 1360 -> 512]
+        MLP --> Res3[Residual Add\nx + scale * SwiGLU]
     end
     
     Emb --> Core
     Core --> OutNorm[Final RMSNorm]
-    OutNorm --> Head[Tied LM Head\nLinear 256 -> 2048]
+    OutNorm --> Head[Tied LM Head\nLinear 512 -> 32,000]
     Head --> Gen[Top-K / Temperature / Greedy Decoding]
 ```
 
-### 1. The Damped Wave Kernel ($O(L \log L)$)
-Instead of computing an $L \times L$ attention matrix for sequence mixing, the WaveKernel treats hidden features as continuous spatial-temporal waves governed by a damped wave equation:
+### 1. Selective Damped Wave Kernel (Mamba-Inspired)
+Instead of computing an $L \times L$ attention matrix, the WaveKernel treats hidden features as continuous spatial-temporal waves governed by a damped wave equation. 
+**New in v2.0:** The decay rate is now dynamically modulated by the input (Selective Gating), allowing the model to selectively remember or forget information across the sequence:
+$$k_d(t) = e^{-\alpha_d(x) t} \cos(\omega_d t + \phi_d)$$
+The layer computes sequence-wide convolution via Real Fast Fourier Transforms (`torch.fft.rfft`), achieving global receptive field coverage in $O(D \cdot L \log L)$ time.
 
-$$k_d(t) = e^{-\alpha_d t} \cos(\omega_d t + \phi_d)$$
+### 2. Causal Delta Memory + RoPE
+To enable associative recall, the model projects states into queries, keys, and values. **New in v2.0:** Rotary Position Embeddings (RoPE) are applied to Q and K, granting the model relative position awareness without fixed positional embeddings.
+$$A = \text{tril}(\text{RoPE}(Q) \text{RoPE}(K)^T), \quad Y = A V$$
 
-- $\alpha_d$: Learnable damping rate ensuring numerical stability.
-- $\omega_d$: Learnable oscillation frequency across channels.
-- $\phi_d$: Initial phase shift.
-
-The layer computes sequence-wide convolution in the frequency domain via Real Fast Fourier Transforms (`torch.fft.rfft`), achieving global receptive field coverage in $O(D \cdot L \log L)$ time.
-
-### 2. Causal Delta Memory ($O(L^2 D)$)
-To enable associative recall, the model projects states into queries, keys, and values ($Q, K, V$). Keys are normalized, and a causal lower-triangular mask ensures no token accesses future information:
-
-$$A = \text{tril}(Q K^T), \quad Y = A V$$
-
-By computing the $L \times L$ causal formulation when sequence length ($L=128$) is smaller than feature dimension ($D=256$), the implementation avoids $D \times D$ autograd state explosion, keeping VRAM usage negligible on 4GB GPUs.
+### 3. SwiGLU FFN
+The standard GELU Feed-Forward Network has been replaced with a Llama-style Gated Linear Unit (SwiGLU) for superior gradient flow.
 
 ---
 
 ## Model Specifications
 
-| Parameter | Configuration Value | Description |
-|---|---|---|
-| **Model Dimension ($D$)** | `256` | Hidden dimension across all blocks |
-| **Number of Layers ($N$)** | `6` | Repeated Wave-Delta transformer blocks |
-| **Vocabulary Size ($V$)** | `2,048` | Subword BPE tokens |
-| **Sequence Length ($L$)** | `128` | Maximum sequence context window |
-| **MLP Expansion ($r$)** | `4x` (1,024 dim) | Feed-forward intermediate dimension |
-| **Weight Tying** | Enabled | Input embedding and output projection share weights |
-| **Total Parameters** | **4,894,982 (~4.89M)** | Full trainable parameter count |
+| Parameter | GTX 1650 (Local) | Colab T4 (Scaled) | Description |
+|---|---|---|---|
+| **Model Dimension ($D$)** | `256` | `512` | Hidden dimension across all blocks |
+| **Number of Layers ($N$)** | `6` | `12` | Repeated Wave-Delta blocks |
+| **Attention Heads ($H$)** | `4` | `8` | Multi-head dimension division |
+| **Vocabulary Size ($V$)** | `8,192` | `32,000` | Subword BPE tokens |
+| **Context Window ($L$)** | `512` | `2,048` | Maximum sequence context window |
+| **Total Parameters** | **7.77M** | **61.56M** | Full trainable parameter count |
 
 ---
 
-## Project Structure
+## New Features
 
-```
-ark-chat/
-├── ARCHITECTURE.md              # Detailed technical specification and complexity analysis
-├── README.md                    # Project documentation and guide
-├── requirements.txt             # Environment dependencies
-├── wave_delta_model.pt          # Pre-trained base language model weights
-├── wave_delta_chat_model.pt     # Fine-tuned conversational model weights
-│
-├── configs/
-│   └── base_config.yaml         # Model hyper-parameters and training configuration
-│
-├── data/
-│   ├── tokenizer.py             # Byte-Level BPE tokenizer implementation
-│   ├── input.txt                # Raw Wikitext-2 pretraining corpus (10.5 MB)
-│   ├── bpe_state.pt             # Cached vocabulary and merge state
-│   ├── encoded_tokens.pt        # Pre-encoded token dataset (3.45M tokens)
-│   ├── chat_train.jsonl         # Curated multi-turn instruction dataset
-│   └── chat_train.example.jsonl # Template schema for dataset expansion
-│
-├── models/
-│   ├── transformer.py           # WaveDeltaTransformer & WaveDeltaBlock definitions
-│   └── layers/
-│       ├── wave_kernel.py       # Frequency-domain FFT wave convolution
-│       ├── delta_memory.py      # Causal low-memory associative recall
-│       └── norm.py              # Root Mean Square Normalization (RMSNorm)
-│
-├── scripts/
-│   ├── prepare_wiki.py          # Downloads and sanitizes Wikitext-2 corpus
-│   ├── prepare_chat_data.py     # Downloads and converts instruction datasets
-│   ├── train.py                 # Self-supervised base language model pretraining
-│   ├── train_chat.py            # Supervised conversational fine-tuning
-│   └── chat_interface.py       # Interactive terminal chat CLI
-│
-└── utils/
-    ├── logger.py                # Logging utilities
-    └── physics_diag.py          # Wave kernel diagnostic and scaling benchmark tools
-```
+### 🧠 Chain-of-Thought (CoT) Reasoning
+The data pipeline (`prepare_colab_data.py`) now synthesizes and downloads high-quality CoT data, including:
+- Synthetic step-by-step arithmetic (addition, multiplication, word problems)
+- Logical syllogisms and if-then deductions
+- MetaMathQA reasoning datasets
+The chat interface automatically formats `<think> ... </think>` blocks in dim gray text in your terminal to visualize the model's reasoning process!
+
+### 🌐 Live Web Reading
+You can now paste web URLs directly into the chat interface! The model will fetch the live HTML, strip out the noise, and inject the clean text directly into the 2,048-token context window so it can answer questions based on live websites.
 
 ---
 
-## Quick Start
+## Google Colab T4 Training (Recommended)
+
+To fully train the 62M parameter model on a free Google Colab T4 GPU:
+
+1. Open Google Colab, create a new notebook, and set Runtime to **T4 GPU**.
+2. Run the setup cell:
+```python
+!git clone https://github.com/YOUR_USERNAME/ark-chat.git
+%cd ark-chat
+!pip install -q torch pyyaml pandas tokenizers datasets
+```
+3. Run the automated training pipeline (takes ~5-6 hours):
+```python
+!python scripts/colab_train.py --all
+```
+4. Download the resulting `wave_delta_chat_model_colab.pt`, `data/colab_bpe_state.pt`, and `configs/colab_config.yaml` to run locally!
+
+---
+
+## Local Development (GTX 1650 / 4GB VRAM)
 
 ### 1. Installation
-
-Clone the repository and set up a Python virtual environment:
-
 ```bash
-git clone https://github.com/your-username/ark-chat.git
+git clone https://github.com/YOUR_USERNAME/ark-chat.git
 cd ark-chat
-
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Pre-Training the Base Model
-
-Download the clean Wikipedia subset (Wikitext-2) and train the base model:
-
+### 2. Pre-Training & Fine-Tuning
 ```bash
-# 1. Download and sanitize Wikitext-2 corpus
-python scripts/prepare_wiki.py
-
-# 2. Train the base language model
+# 1. Train the base language model
 python scripts/train.py
-```
 
-*Training takes ~25 seconds per epoch on an NVIDIA GTX 1650 (421 batches/epoch at batch size 64).*
-
-### 3. Instruction Fine-Tuning
-
-Fine-tune the pre-trained base model into a conversational assistant using supervised question-answering data:
-
-```bash
+# 2. Fine-tune on conversational instruction data
 python scripts/train_chat.py \
   --data data/chat_train.jsonl \
-  --epochs 10 \
-  --learning-rate 1e-4 \
-  --batch-size 4 \
-  --save-mode val_loss \
-  --patience 2
+  --epochs 10 --batch-size 4 --save-mode val_loss
 ```
 
-**Key Fine-Tuning Features:**
-- **Assistant-Only Loss Masking**: User prompts and padding tokens are masked with `-100`, optimizing gradients exclusively on assistant responses.
-- **Validation-Based Early Stopping**: Automatically stops if validation loss ceases improving to prevent catastrophic forgetting.
-- **Multi-Format Ingestion**: Supports OpenAI `messages`, ShareGPT (`conversations`), and Alpaca (`instruction` + `output`) schemas.
-
-### 4. Interactive Chat
-
-Launch the interactive chat interface in your terminal:
-
+### 3. Interactive Chat
+Launch the interactive chat interface (supports web URLs in your prompt!):
 ```bash
-# Deterministic greedy decoding
-python scripts/chat_interface.py --greedy
-
-# Creative sampling with temperature and Top-K filtering
-python scripts/chat_interface.py --temperature 0.3 --top-k 5
+python scripts/chat_interface.py --temperature 0.3 --top-k 10
 ```
 
 ---
 
 ## Algorithmic Complexity
 
-| Architecture Component | Training Complexity (Parallel) | Inference Latency (per Token) | Working State Memory |
-|---|---|---|---|
-| **RMSNorm** | $O(L \cdot D)$ | $O(D)$ | None |
-| **WaveKernel (SSM Dual)** | $O(D \cdot L \log L)$ | **$O(D)$** | $2D$ floats (complex state $h_t$) |
-| **DeltaMemory (Chunked)** | **$O(L \cdot C \cdot D + \frac{L}{C} D^2)$** | **$O(D^2)$** | $D^2$ floats (matrix state $S_t$) |
-| **Feed-Forward MLP** | $O(L \cdot D^2)$ | $O(D^2)$ | None |
-| **Total Block Pass** | **$\mathcal{O}(L \log L)$ sub-quadratic** | **$\mathcal{O}(1)$ constant time** | Low VRAM (~1.2 GB total) |
+| Architecture Component | Training Complexity (Parallel) | Inference Latency (per Token) |
+|---|---|---|
+| **Selective WaveKernel** | $O(D \cdot L \log L)$ | **$O(D)$** |
+| **DeltaMemory + RoPE** | $O(L \cdot C \cdot D + \frac{L}{C} D^2)$ | **$O(D^2)$** |
+| **Total Block Pass** | **$\mathcal{O}(L \log L)$ sub-quadratic** | **$\mathcal{O}(1)$ constant time** |
 
 Unlike standard Transformers that require $O(L \cdot D)$ KV-cache computation per token at inference time, Ark-Chat generates tokens in strictly **$O(1)$ constant time** via its dual state-space recurrent cache.
-
----
-
-## Customizing Instruction Data
-
-You can add custom domain conversations to `data/chat_train.jsonl` using the standard multi-turn schema:
-
-```json
-{"messages": [
-  {"role": "system", "content": "You are a concise scientific assistant."},
-  {"role": "user", "content": "What is the speed of light in a vacuum?"},
-  {"role": "assistant", "content": "The speed of light in a vacuum is approximately 299,792,458 meters per second."}
-]}
-```
-
-Or convert open instruction datasets automatically:
-
-```bash
-python scripts/prepare_chat_data.py
-```
 
 ---
 
 ## License
 
 This project is licensed under the MIT License — see the LICENSE file for details.
-
