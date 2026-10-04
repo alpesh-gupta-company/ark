@@ -71,10 +71,27 @@ def step2_train_tokenizer(config):
     tokenizer = BPETokenizer(vocab_size=config["model"]["vocab_size"])
     tokenizer.train("data/colab_pretrain.txt")
 
-    print("🔤 Encoding pretraining corpus...")
+    print("🔤 Encoding pretraining corpus (chunked to save RAM)...")
+    tokens = []
+    import sys
     with open("data/colab_pretrain.txt", "r", encoding="utf-8") as f:
-        text = f.read()
-    tokens = tokenizer.encode(text)
+        # Read in chunks of lines to avoid OOM killer
+        chunk_lines = []
+        for i, line in enumerate(f):
+            if line.strip():
+                chunk_lines.append(line)
+            if len(chunk_lines) >= 100000:
+                # Encode chunk
+                for l in chunk_lines:
+                    tokens.extend(tokenizer.encode(l))
+                chunk_lines = []
+                sys.stdout.write(f"\r  Encoded {i} lines... ({len(tokens)/1e6:.1f}M tokens)")
+                sys.stdout.flush()
+        # Encode remaining
+        for l in chunk_lines:
+            tokens.extend(tokenizer.encode(l))
+            
+    print(f"\n  Finished encoding {len(tokens)/1e6:.1f}M tokens.")
 
     save_state = tokenizer.get_state()
     torch.save(save_state, tokenizer_path)
