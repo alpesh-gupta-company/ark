@@ -128,8 +128,14 @@ def step3_base_pretrain(config):
     from data.tokenizer import BPETokenizer
     from models.transformer import WaveDeltaTransformer
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🖥️ Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    if use_cuda:
+        print(f"🖥️ Device: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_mem / 1e9:.0f}GB VRAM)")
+    else:
+        print("⚠️  WARNING: No GPU detected! Training on CPU will be extremely slow.")
+        print("   Go to Runtime → Change runtime type → Select T4 GPU")
+        print("   Then restart and re-run this cell.")
 
     # Load tokenizer
     tokenizer = BPETokenizer(vocab_size=config["model"]["vocab_size"])
@@ -168,16 +174,9 @@ def step3_base_pretrain(config):
 
     dataset = PretrainDataset(tokens, seq_len)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                        pin_memory=True, num_workers=2)
+                        pin_memory=use_cuda, num_workers=2)
 
     model = WaveDeltaTransformer(**config["model"]).to(device)
-    
-    # ⚡ T4 Optimization: Compile the model for massive speedup (PyTorch 2.0+)
-    print("⚡ Compiling model for T4 Tensor Cores (this takes a minute...)")
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        print(f"⚠️ torch.compile failed (falling back to eager mode): {e}")
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"📊 Model: {param_count:,} parameters ({param_count/1e6:.1f}M)")
@@ -186,7 +185,7 @@ def step3_base_pretrain(config):
     total_steps = (len(loader) // grad_accum) * epochs
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda") if use_cuda else None
 
     vocab_size = config["model"]["vocab_size"]
     print(f"\n🚀 Base Pretraining | {len(loader)} batches/epoch | {epochs} epochs")
@@ -203,18 +202,25 @@ def step3_base_pretrain(config):
         for batch_idx, (x, y) in enumerate(loader):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast(device.type, enabled=use_cuda):
                 logits = model(x)
                 loss = criterion(logits.view(-1, vocab_size), y.view(-1))
                 loss = loss / grad_accum
 
-            scaler.scale(loss).backward()
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == len(loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
