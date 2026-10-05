@@ -71,9 +71,14 @@ def step2_train_tokenizer(config):
     tokenizer = BPETokenizer(vocab_size=config["model"]["vocab_size"])
     tokenizer.train("data/colab_pretrain.txt")
 
-    print("🔤 Encoding pretraining corpus (chunked to save RAM)...")
-    tokens = []
+    print("🔤 Encoding pretraining corpus (using compact array to save RAM)...")
     import sys
+    import array
+    
+    # Use 'i' (signed 32-bit int) which takes 4 bytes per token. 
+    # 500M tokens * 4 bytes = 2GB RAM (a standard list would take ~18GB!)
+    tokens = array.array('i') 
+    
     with open("data/colab_pretrain.txt", "r", encoding="utf-8") as f:
         # Read in chunks of lines to avoid OOM killer
         chunk_lines = []
@@ -95,8 +100,13 @@ def step2_train_tokenizer(config):
 
     save_state = tokenizer.get_state()
     torch.save(save_state, tokenizer_path)
-    torch.save(tokens, tokens_path)
-    print(f"✅ Tokenizer saved (vocab: {len(tokenizer.vocab)}), tokens cached ({len(tokens):,})")
+    
+    print("💾 Converting to tensor and saving (this takes a moment)...")
+    # Convert array to tensor efficiently
+    import torch
+    tensor_tokens = torch.tensor(tokens, dtype=torch.long)
+    torch.save(tensor_tokens, tokens_path)
+    print(f"✅ Tokenizer saved (vocab: {len(tokenizer.vocab)}), tokens cached ({len(tensor_tokens):,})")
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
